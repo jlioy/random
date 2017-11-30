@@ -92,9 +92,9 @@ struct slob_block {
 };
 typedef struct slob_block slob_t;
 
-//These variables are used to keep track of the memory usage during testing
-unsigned long slobs = 0;
-unsigned long slobu = 0;
+/* Used for sys calls */
+unsigned long mem_slob_size = 0;
+unsigned long mem_slob_used = 0;
 
 /*
  * All partially free slob pages go on these lists.
@@ -115,13 +115,13 @@ static inline int slob_page_free(struct page *sp)
 
 static void set_slob_page_free(struct page *sp, struct list_head *list)
 {
-	list_add(&sp->lru, list);
+	list_add(&sp->list, list);
 	__SetPageSlobFree(sp);
 }
 
 static inline void clear_slob_page_free(struct page *sp)
 {
-	list_del(&sp->lru);
+	list_del(&sp->list);
 	__ClearPageSlobFree(sp);
 }
 
@@ -205,7 +205,7 @@ static void *slob_new_pages(gfp_t gfp, int order, int node)
 	if (!page)
 		return NULL;
 
-	slobs += PAGE_SIZE;
+	mem_slob_size += PAGE_SIZE;
 	return page_address(page);
 }
 
@@ -213,7 +213,7 @@ static void slob_free_pages(void *b, int order)
 {
 	if (current->reclaim_state)
 		current->reclaim_state->reclaimed_slab += 1 << order;
-	slobs -= PAGE_SIZE;
+	mem_slob_size -= PAGE_SIZE;
 	free_pages((unsigned long)b, order);
 }
 
@@ -261,7 +261,7 @@ static void *slob_page_alloc(struct page *sp, size_t size, int align)
 			sp->units -= units;
 			if (!sp->units)
 				clear_slob_page_free(sp);
-				slobu += units;
+				mem_slob_used += units;
 			return cur;
 		}
 		if (slob_last(cur))
@@ -275,7 +275,7 @@ static void *slob_page_alloc(struct page *sp, size_t size, int align)
 static void *slob_alloc(size_t size, gfp_t gfp, int align, int node)
 {
 	struct page *sp;
-	struct page *spb = NULL;
+	struct page *sp_best = NULL;
 	struct list_head *prev;
 	struct list_head *slob_list;
 	slob_t *b = NULL;
@@ -302,15 +302,32 @@ static void *slob_alloc(size_t size, gfp_t gfp, int align, int node)
 		/* Enough room on this page? */
 		if (sp->units < SLOB_UNITS(size))
 			continue;
+		
+		/* If we have page with room, check if it's the best so far 
+ 		 * If the new page (sp->units) is smaller than what we have
+ 		 * (sp_best->units) then it is a better fit. 
+		 */
+		if ((sp_best == NULL) || (sp_best->units > sp->units))
+			sp_best = sp;
 
-		//This is checking to see if the page we are at is the best fit so far.
-		if ((spb == NULL) || (spb->units > sp->units))
-			spb = sp;
 	}
-		/* Attempt to alloc */
-		if (spb != NULL) {
-			b = slob_page_alloc(spb, size, align);
-		}
+	/* Attempt to alloc */
+	if (sp_best != NULL) {
+		b = slob_page_alloc(sp_best, size, align);
+	}
+
+	/* Recalculate free space 
+	mem_slob_free = 0;
+	list_for_each_entry(sp, &free_slob_small, list) {
+		mem_slob_free += sp->units;
+	}
+	list_for_each_entry(sp, &free_slob_medium, list) {
+		mem_slob_free += sp->units;
+	}
+	list_for_each_entry(sp, &free_slob_large, list) {
+		mem_slob_free += sp->units;
+	}
+	*/
 
 	spin_unlock_irqrestore(&slob_lock, flags);
 
@@ -325,7 +342,7 @@ static void *slob_alloc(size_t size, gfp_t gfp, int align, int node)
 		spin_lock_irqsave(&slob_lock, flags);
 		sp->units = SLOB_UNITS(PAGE_SIZE);
 		sp->freelist = b;
-		INIT_LIST_HEAD(&sp->lru);
+		INIT_LIST_HEAD(&sp->list);
 		set_slob(b, SLOB_UNITS(PAGE_SIZE), b + SLOB_UNITS(PAGE_SIZE));
 		set_slob_page_free(sp, slob_list);
 		b = slob_page_alloc(sp, size, align);
@@ -390,7 +407,7 @@ static void slob_free(void *block, int size)
 	 * point.
 	 */
 	sp->units += units;
-	slobu -= units;
+	mem_slob_used -= units;
 
 	if (b < (slob_t *)sp->freelist) {
 		if (b + units == sp->freelist) {
@@ -423,14 +440,19 @@ out:
 	spin_unlock_irqrestore(&slob_lock, flags);
 }
 
-SYSCALL_DEFINE0(memory_size)
+/*
+ * system calls
+ */
+
+SYSCALL_DEFINE0(mem_size)
 {
-	return slobs;
+	return mem_slob_size;
 }
 
-SYSCALL_DEFINE0(memory_used)
+SYSCALL_DEFINE0(mem_used)
 {
-	return slobu;
+
+	return mem_slob_used;
 }
 
 /*
@@ -634,11 +656,11 @@ int __kmem_cache_shutdown(struct kmem_cache *c)
 	return 0;
 }
 
-int __kmem_cache_shrink(struct kmem_cache *d)
+int kmem_cache_shrink(struct kmem_cache *d)
 {
 	return 0;
 }
-EXPORT_SYMBOL(__kmem_cache_shrink);
+EXPORT_SYMBOL(kmem_cache_shrink);
 
 struct kmem_cache kmem_cache_boot = {
 	.name = "kmem_cache",
